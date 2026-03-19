@@ -48,12 +48,12 @@ with st.container():
 
     with tabs[0]:
         uploaded_file = st.file_uploader(
-            "",
-            type=["wav", "mp3", "ogg"],
-            help="Supported formats: WAV, MP3, OGG"
-        )
-        if uploaded_file is not None:
-            audio_bytes = uploaded_file.read()
+        "Upload audio file",
+        type=["wav", "mp3", "ogg"],
+        help="Supported formats: WAV, MP3, OGG"
+    )
+    if uploaded_file is not None:
+        audio_bytes = uploaded_file.read()
 
     with tabs[1]:
         st.info("Record a short voice note (allow microphone access).")
