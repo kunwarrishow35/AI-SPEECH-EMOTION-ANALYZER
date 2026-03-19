@@ -4,9 +4,22 @@ import plotly.express as px
 import streamlit as st
 
 
+import tempfile
+import os
+
 def load_audio(file_path_or_bytes, target_sr=16000):
     """Load audio and resample to the target sample rate."""
-    audio, sr = librosa.load(file_path_or_bytes, sr=target_sr)
+    if hasattr(file_path_or_bytes, "read"):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+            tmp_file.write(file_path_or_bytes.read())
+            tmp_path = tmp_file.name
+        try:
+            audio, sr = librosa.load(tmp_path, sr=target_sr)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    else:
+        audio, sr = librosa.load(file_path_or_bytes, sr=target_sr)
     return audio, sr
 
 
@@ -30,9 +43,9 @@ def plot_probability_distribution(probabilities, labels):
         xaxis_title="Confidence (%)",
         yaxis_title="",
         template="plotly_dark",
-        margin=dict(l=0, r=0, t=10, b=0),
+        margin={"l": 0, "r": 0, "t": 10, "b": 0},
         height=300,
-        font=dict(size=14, color="#e2e8f0"),
+        font={"size": 14, "color": "#e2e8f0"},
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)"
     )

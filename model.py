@@ -9,8 +9,9 @@ import librosa
 import numpy as np
 
 
-# Emotion categories used in the app
-EMOTION_LABELS = ["Happy", "Sad", "Angry", "Neutral", "Fearful", "Surprised"]
+# Emotion categories for 6-class Hackathon demo
+# Extrapolates standard 4 classes (Neutral, Happy, Angry, Sad) via blending
+EMOTION_LABELS = ["Neutral", "Happy", "Angry", "Sad", "Fearful", "Surprised"]
 
 
 class EmotionDetectionModel:
@@ -29,12 +30,34 @@ class EmotionDetectionModel:
     def predict(self, audio_array, sr=16000):
         """
         Run inference on audio input and return predicted emotion.
+        Maps 4 original classes to 6 classes based on probabilistic blending and exact audio heuristics.
         """
-        # Convert stereo to mono if needed
+        # Ensure statelessness by copying the raw array
+        audio_array = np.copy(audio_array)
+
+        # Preprocessing: Convert stereo to mono
         if len(audio_array.shape) > 1:
             audio_array = audio_array.mean(axis=1)
 
-        # Extract features
+        # Preprocessing: Trim dead silence
+        audio_array, _ = librosa.effects.trim(audio_array, top_db=30)
+        
+        # Ensure minimum length for consistency
+        if len(audio_array) < sr * 1.0:
+            pad_length = int(sr * 1.0) - len(audio_array)
+            audio_array = np.pad(audio_array, (0, pad_length), mode='constant')
+
+        # Audio-Based Heuristics: Calculate low energy and variance BEFORE normalization
+        rms_energy = np.mean(librosa.feature.rms(y=audio_array))
+        variance = np.var(audio_array)
+
+        # Preprocessing: Amplitude normalization
+        audio_array = np.asarray(audio_array, dtype=np.float32)
+        max_val = np.max(np.abs(audio_array))
+        if max_val > 0:
+            audio_array = audio_array / max_val
+
+        # Features Extraction
         inputs = self.processor(
             audio_array,
             sampling_rate=sr,
@@ -42,30 +65,76 @@ class EmotionDetectionModel:
             padding=True
         )
 
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
         with torch.no_grad():
-            outputs = self.model(**inputs)
-            logits = outputs.logits
+            inputs = {k: v.clone().detach().to(self.device) for k, v in inputs.items()}
+            outputs = self.model(**inputs, output_attentions=False, output_hidden_states=False)
+            
+            logits = outputs.logits.clone().detach().cpu()
 
-            # Adjust output if model classes don't match our 6 labels
-            if logits.shape[1] != len(EMOTION_LABELS):
-                torch.manual_seed(42)  # keep mapping consistent
-                projection = torch.randn(
-                    logits.shape[1],
-                    len(EMOTION_LABELS)
-                ).to(self.device)
+            # 3. Probability Calibration: Apply temperature scaling for soft predictions
+            temperature = 1.5 
+            logits = logits / temperature
 
-                logits = torch.matmul(logits, projection)
+            # Extract base 4-class probabilities (Neutral, Happy, Angry, Sad)
+            probs_4 = torch.nn.functional.softmax(logits, dim=-1).squeeze().numpy()
 
-            probabilities = torch.nn.functional.softmax(logits, dim=-1)
-            probabilities = probabilities.squeeze().cpu().numpy()
+            # 1. Class Mapping: Map 4 bases into 6 target classes smoothly
+            probs_6 = np.zeros(6, dtype=np.float32)
+            
+            # Shift bases (leaving ~10-20% for synthetic blending)
+            probs_6[0] = probs_4[0] * 0.90  # Neutral
+            probs_6[1] = probs_4[1] * 0.80  # Happy
+            probs_6[2] = probs_4[2] * 0.85  # Angry
+            probs_6[3] = probs_4[3] * 0.85  # Sad
+            
+            # Synthetic Class: Fearful (Blending Sad + Angry characteristics)
+            probs_6[4] = (probs_4[2] * 0.15) + (probs_4[3] * 0.15)
+            # Synthetic Class: Surprised (Blending Happy + Neutral excitation)
+            probs_6[5] = (probs_4[1] * 0.20) + (probs_4[0] * 0.10)
 
-            pred_idx = np.argmax(probabilities)
-            confidence = probabilities[pred_idx]
+            # 2. & 4. Audio-Based Heuristics and Anti-Bias Correction
+            # Low energy / flat audio strongly biases towards "Neutral"
+            if rms_energy < 0.015 or variance < 0.0005:
+                probs_6[0] += 0.35
+                probs_6[2] *= 0.4   # Heavily penalize Angry
+                probs_6[1] *= 0.5   # Penalize Happy
+                probs_6[5] *= 0.5   # Penalize Surprised
+                
+            # High energy thresholding avoids false flat readings
+            elif rms_energy > 0.08:
+                probs_6[2] += 0.15  # Boost Angry
+                probs_6[5] += 0.10  # Boost Surprised
+
+            # 6. Smoothing: Redistribute slight probabilities to avoid sharp 0s
+            probs_6 = np.maximum(probs_6, 0.02)
+            
+            # Normalize to valid distribution
+            probs_6 = probs_6 / np.sum(probs_6)
+
+            # 7. Confidence Logic & Fallbacks
+            pred_idx = np.argmax(probs_6)
+            confidence = probs_6[pred_idx]
+            
+            # Fallback to Neutral under low confidence (skewed or chaotic distribution)
+            if confidence < 0.35:
+                probs_6[0] += 0.2  
+                probs_6 = probs_6 / np.sum(probs_6)
+                pred_idx = 0
+                confidence = probs_6[pred_idx]
+
             emotion = EMOTION_LABELS[pred_idx]
 
-        return emotion, float(confidence), probabilities.tolist()
+            # 8. Debugging Output Ensure variation across inputs
+            print(f"[DEBUG] Audio RMS Energy: {rms_energy:.4f} | Audio Variance: {variance:.5f}")
+            print(f"[DEBUG] Base 4-Class Softmax: {np.round(probs_4, 3)}")
+            print(f"[DEBUG] Final 6-Class Blend: {np.round(probs_6, 3)}")
+            
+            # GC Cleanup
+            del outputs, logits
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return emotion, float(confidence), probs_6.tolist()
 
 
 # -------------------- DATASET --------------------
